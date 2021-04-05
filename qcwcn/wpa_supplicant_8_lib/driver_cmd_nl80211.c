@@ -641,15 +641,13 @@ int wpa_driver_nl80211_driver_event(struct wpa_driver_nl80211_data *drv,
 					   u8 *data, size_t len)
 {
 	int ret = -1;
-	wpa_printf(MSG_INFO, "wpa_driver_nld80211 vendor event recieved");
 	switch(subcmd) {
 		case QCA_NL80211_VENDOR_SUBCMD_CONFIG_TWT:
 			ret = wpa_driver_nl80211_oem_event(drv, vendor_id, subcmd,
 					data, len);
 			break;
 		default:
-			wpa_printf(MSG_DEBUG, "Unsupported vendor event recieved %d",
-					subcmd);
+			break;
 	}
 	return ret;
 }
@@ -1307,7 +1305,7 @@ static int get_sta_info_handler(struct nl_msg *msg, void *arg)
 	vendor_data = nla_data(tb[NL80211_ATTR_VENDOR_DATA]);
 	vendor_len = nla_len(tb[NL80211_ATTR_VENDOR_DATA]);
 
-	if (nla_parse(tb_vendor, NL80211_ATTR_MAX_INTERNAL,
+	if (nla_parse(tb_vendor, GET_STA_INFO_MAX,
 		      vendor_data, vendor_len, NULL)) {
 		wpa_printf(MSG_ERROR,"NL80211_ATTR_VENDOR_DATA parse error");
 		return -1;
@@ -1881,9 +1879,9 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 			return strlen(buf);
 		} else if ((ret == WPA_DRIVER_OEM_STATUS_FAILURE) &&
 							 (status != 0)) {
-			wpa_printf(MSG_DEBUG, "%s: Received error: %d",
-					__func__, ret);
-			return -1;
+			wpa_printf(MSG_DEBUG, "%s: Received error: %d status: %d",
+					__func__, ret, status);
+			return status;
 		}
 		/* else proceed with legacy handling as below */
 	}
