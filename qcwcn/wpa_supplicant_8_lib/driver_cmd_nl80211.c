@@ -40,9 +40,9 @@
 #define UNUSED(x)	(void)(x)
 #define NL80211_ATTR_MAX_INTERNAL 256
 #define CSI_STATUS_REJECTED      -1
+#define CSI_STATUS_SUCCESS        0
 #define ENHANCED_CFR_VER          2
 #define CSI_GROUP_BITMAP          1
-#define MAX_CSI_DURATION          900 /* second */
 #define CSI_DEFAULT_GROUP_ID      0
 #define CSI_FC_STYPE_BEACON       8
 #define CSI_MGMT_BEACON           (1<<WLAN_FC_STYPE_BEACON)
@@ -57,6 +57,7 @@ struct csi_global_params {
 	struct i802_bss *bss;
 	enum csi_state current_state;
 	char connected_bssid[MAC_ADDR_LEN];
+	int transport_mode;
 };
 
 static struct csi_global_params g_csi_param = {0};
@@ -94,7 +95,11 @@ static int wpa_driver_cmd_set_ani_level(struct i802_bss *bss, int mode, int ofdm
 		}
 	}
 	nla_nest_end(msg, params);
+#ifndef CONFIG_ANDROID_S
 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+#else
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
+#endif
 	if (!ret)
 		return 0;
 	wpa_printf(MSG_ERROR, "%s: Failed set_ani_level, ofdmlvl=%d, ret=%d",
@@ -151,7 +156,11 @@ static int wpa_driver_cmd_set_congestion_report(struct i802_bss *bss, char *cmd)
 		}
 	}
 	nla_nest_end(msg, params);
+#ifndef CONFIG_ANDROID_S
 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+#else
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
+#endif
 	wpa_printf(MSG_INFO, "%s: set congestion report: enable=%d, threshold=%d,"
 			"interval=%d", __FUNCTION__, enable, threshold, interval);
 	if (!ret)
@@ -189,7 +198,11 @@ static int wpa_driver_cmd_set_tx_power(struct i802_bss *bss, char *cmd)
 		return -ENOBUFS;
 	}
 
+#ifndef CONFIG_ANDROID_S
 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+#else
+	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
+#endif
 	if (!ret)
 		return 0;
 
@@ -672,15 +685,32 @@ int wpa_driver_nl80211_oem_event(struct wpa_driver_nl80211_data *drv,
 	return ret;
 }
 
+static int wpa_driver_restart_csi(struct i802_bss *bss, int *status);
+
 int wpa_driver_nl80211_driver_event(struct wpa_driver_nl80211_data *drv,
 					   u32 vendor_id, u32 subcmd,
 					   u8 *data, size_t len)
 {
 	int ret = -1;
+	int status = -1;
+	struct i802_bss *bss;
 	switch(subcmd) {
 		case QCA_NL80211_VENDOR_SUBCMD_CONFIG_TWT:
 			ret = wpa_driver_nl80211_oem_event(drv, vendor_id, subcmd,
 					data, len);
+			break;
+		case QCA_NL80211_VENDOR_SUBCMD_KEY_MGMT_ROAM_AUTH:
+			if(g_csi_param.current_state == CSI_STATE_START) {
+				bss = get_bss_ifindex(drv, drv->ifindex);
+				if(bss == NULL) {
+					wpa_printf(MSG_DEBUG, "%s: bss is NULL",
+							__func__);
+					break;
+				}
+				if(wpa_driver_restart_csi(bss, &status))
+					wpa_printf(MSG_DEBUG, "csi_restart failed %d",
+						   status);
+			}
 			break;
 		default:
 			break;
@@ -1856,6 +1886,11 @@ static int wpa_driver_get_all_sta_info(struct i802_bss *bss, int *status)
 	struct sta_info *sta;
 	int ret, total_ret = 0;
 
+	if(bss->drv && bss->drv->nlmode != NL80211_IFTYPE_AP) {
+		wpa_printf(MSG_ERROR,"Not a hapd interface");
+		return -1;
+	}
+
 	if (!hapd) {
 		wpa_printf(MSG_ERROR,"hapd is NULL");
 		return -1;
@@ -1963,7 +1998,11 @@ static int wpa_driver_cmd_get_thermal_info(struct i802_bss *bss, int *result, in
 	}
 
 	nla_nest_end(msg, params);
+#ifndef CONFIG_ANDROID_S
 	ret = send_and_recv_msgs(drv, msg, thermal_info_handler, result);
+#else
+	ret = send_and_recv_msgs(drv, msg, thermal_info_handler, result, NULL, NULL);
+#endif
 	if (!ret)
 		return 0;
 	wpa_printf(MSG_ERROR, "%s: Failed get thermal info, ret=%d(%s)",
@@ -2029,9 +2068,7 @@ static int get_scan_handler(struct nl_msg *msg, void *arg)
 	return 0;
 }
 
-static int wpa_driver_send_get_scan_cmd(struct i802_bss *bss,
-					    char *buf, size_t buf_len,
-					    int *status)
+static int wpa_driver_send_get_scan_cmd(struct i802_bss *bss, int *status)
 {
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 	struct nl_msg *nlmsg;
@@ -2054,14 +2091,12 @@ static int wpa_driver_send_get_scan_cmd(struct i802_bss *bss,
 	return WPA_DRIVER_OEM_STATUS_SUCCESS;
 }
 
-static int wpa_driver_start_csi_capture(struct i802_bss *bss, char *cmd,
-				     char *buf, size_t buf_len,
-				     int *status, int transport_mode)
+static int wpa_driver_start_csi_capture(struct i802_bss *bss, int *status,
+					int transport_mode)
 {
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 	struct nl_msg *nlmsg;
 	struct nlattr *attr, *attr_table, *attr_entry;
-	struct resp_info info;
 	char ta_mask[MAC_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 	nlmsg = prepare_vendor_nlmsg(drv, bss->ifname,
@@ -2149,10 +2184,7 @@ static int wpa_driver_start_csi_capture(struct i802_bss *bss, char *cmd,
 	nla_nest_end(nlmsg, attr_table);
 	nla_nest_end(nlmsg, attr);
 
-	info.reply_buf = buf;
-	info.reply_buf_len = buf_len;
-	*status = send_nlmsg((struct nl_sock *)drv->global->nl, nlmsg,
-			     response_handler, &info);
+	*status = send_nlmsg((struct nl_sock *)drv->global->nl, nlmsg, NULL, NULL);
 	if (*status != 0) {
 		wpa_printf(MSG_ERROR, "Failed to send nl message with err %d", *status);
 		return WPA_DRIVER_OEM_STATUS_FAILURE;
@@ -2163,14 +2195,11 @@ static int wpa_driver_start_csi_capture(struct i802_bss *bss, char *cmd,
 	return WPA_DRIVER_OEM_STATUS_SUCCESS;
 }
 
-static int wpa_driver_stop_csi_capture(struct i802_bss *bss, char *cmd,
-				     char *buf, size_t buf_len,
-				     int *status)
+static int wpa_driver_stop_csi_capture(struct i802_bss *bss, int *status)
 {
 	struct wpa_driver_nl80211_data *drv = bss->drv;
 	struct nl_msg *nlmsg;
 	struct nlattr *attr;
-	struct resp_info info;
 
 	nlmsg = prepare_vendor_nlmsg(drv, bss->ifname,
 				     QCA_NL80211_VENDOR_SUBCMD_PEER_CFR_CAPTURE_CFG);
@@ -2194,10 +2223,7 @@ static int wpa_driver_stop_csi_capture(struct i802_bss *bss, char *cmd,
 
 	wpa_printf(MSG_DEBUG, "send stop csi cmd");
 	nla_nest_end(nlmsg, attr);
-	info.reply_buf = buf;
-	info.reply_buf_len = buf_len;
-	*status = send_nlmsg((struct nl_sock *)drv->global->nl, nlmsg,
-			     response_handler, &info);
+	*status = send_nlmsg((struct nl_sock *)drv->global->nl, nlmsg, NULL, NULL);
 	if (*status != 0) {
 		wpa_printf(MSG_ERROR, "Failed to send nl message with err %d", *status);
 		return WPA_DRIVER_OEM_STATUS_FAILURE;
@@ -2210,13 +2236,11 @@ static int wpa_driver_stop_csi_capture(struct i802_bss *bss, char *cmd,
 
 static void stop_csi_callback(int nsec)
 {
-	char buf[128];
 	int status = 0;
-	size_t buf_len = 128;
 
 	wpa_printf(MSG_DEBUG, "enter %s, nsec %d", __func__, nsec);
 
-	wpa_driver_stop_csi_capture(g_csi_param.bss, NULL, buf, buf_len, &status);
+	wpa_driver_stop_csi_capture(g_csi_param.bss, &status);
 	if (status)
 		wpa_printf(MSG_ERROR, "Stop CSI failed");
 }
@@ -2235,14 +2259,14 @@ static int wpa_driver_handle_csi_cmd(struct i802_bss *bss, char *cmd,
 		next_arg = get_next_arg(cmd);
 		csi_duration = atoi(next_arg);
 
-		if (csi_duration <= 0 || csi_duration > MAX_CSI_DURATION) {
+		if (csi_duration < 0) {
 			wpa_printf(MSG_ERROR, "Invalid duration");
 			snprintf(buf, buf_len, "FAIL, Invalid duration");
 			*status = CSI_STATUS_REJECTED;
 			return WPA_DRIVER_OEM_STATUS_FAILURE;
 		}
 
-		wpa_driver_send_get_scan_cmd(bss, cmd, buf_len, status);
+		wpa_driver_send_get_scan_cmd(bss, status);
 		if (g_csi_param.connected_bssid[0] == 0xff) {
 			wpa_printf(MSG_DEBUG, "Not connected");
 			snprintf(buf, buf_len, "FAIL, Not connected");
@@ -2251,7 +2275,7 @@ static int wpa_driver_handle_csi_cmd(struct i802_bss *bss, char *cmd,
 		}
 
 		if (g_csi_param.current_state == CSI_STATE_START) {
-			wpa_driver_stop_csi_capture(bss, cmd, buf, buf_len, status);
+			wpa_driver_stop_csi_capture(bss, status);
 			alarm(0);
 		}
 
@@ -2263,10 +2287,10 @@ static int wpa_driver_handle_csi_cmd(struct i802_bss *bss, char *cmd,
 
 		if (transport_mode == 1 || transport_mode == -1)
 			transport_mode = 1;
-		else if (transport_mode == 0)
-			transport_mode = 0;
-		wpa_driver_start_csi_capture(bss, cmd, buf, buf_len, status, transport_mode);
-		if (*status == 0) {
+		g_csi_param.transport_mode = transport_mode;
+
+		wpa_driver_start_csi_capture(bss, status, transport_mode);
+		if (*status == 0 && csi_duration > 0) {
 			signal(SIGALRM, stop_csi_callback);
 			alarm(csi_duration);
 			wpa_printf(MSG_DEBUG, "set alarm %ds done", csi_duration);
@@ -2275,7 +2299,7 @@ static int wpa_driver_handle_csi_cmd(struct i802_bss *bss, char *cmd,
 		if (g_csi_param.current_state != CSI_STATE_START)
 			return WPA_DRIVER_OEM_STATUS_SUCCESS;
 
-		wpa_driver_stop_csi_capture(bss, cmd, buf, buf_len, status);
+		wpa_driver_stop_csi_capture(bss, status);
 		wpa_printf(MSG_DEBUG, "stop csi cmd");
 	} else {
 		wpa_printf(MSG_ERROR, "invalid command");
@@ -2284,6 +2308,28 @@ static int wpa_driver_handle_csi_cmd(struct i802_bss *bss, char *cmd,
 		return WPA_DRIVER_OEM_STATUS_FAILURE;
 	}
 
+	return WPA_DRIVER_OEM_STATUS_SUCCESS;
+}
+
+static int wpa_driver_restart_csi(struct i802_bss *bss, int *status)
+{
+	wpa_driver_send_get_scan_cmd(bss, status);
+	if (g_csi_param.connected_bssid[0] == 0xff) {
+		wpa_printf(MSG_DEBUG, "%s: Not connected", __func__);
+		*status = CSI_STATUS_REJECTED;
+		return WPA_DRIVER_OEM_STATUS_FAILURE;
+	}
+	/* Stop CSI capture on previous bss */
+	if(wpa_driver_stop_csi_capture(g_csi_param.bss, status)) {
+		wpa_printf(MSG_DEBUG, "%s: csi stop failed", __func__);
+	}
+	g_csi_param.bss = bss;
+	if(wpa_driver_start_csi_capture(g_csi_param.bss, status,
+				g_csi_param.transport_mode)) {
+		*status = CSI_STATUS_REJECTED;
+		return WPA_DRIVER_OEM_STATUS_FAILURE;
+	}
+	*status = CSI_STATUS_SUCCESS;
 	return WPA_DRIVER_OEM_STATUS_SUCCESS;
 }
 
